@@ -21,9 +21,9 @@
 import { CopilotSession } from "@github/copilot-sdk";
 import { RoutedMessage, executeMaxCommand, type Attachment } from "./command-router.js";
 import { CLIProcess } from "./cli-process.js";
-import { getActiveWorkspace, logConversation } from "./store/db.js";
+import { getActiveWorkspace, logConversation, clearConversationLog } from "./store/db.js";
 import { getClient } from "./copilot/client.js";
-import { invalidateSession, markPoolBusy, markPoolIdle } from "./copilot-client.js";
+import { destroyAndInvalidateSession, invalidateSession, markPoolBusy, markPoolIdle } from "./copilot-client.js";
 import { config } from "./config.js";
 import { appendFileSync } from "fs";
 import { join } from "path";
@@ -542,6 +542,8 @@ export class MessageHandler {
   private hardTimers = new Map<string, NodeJS.Timeout>();
   /** Composite-key hard-timer reject callbacks (paired with hardTimers) */
   private hardTimerRejects = new Map<string, (err: Error) => void>();
+  /** Composite-key generation, bumped by forceResetWorkspace to suppress stale callbacks. */
+  private channelGenerations = new Map<string, number>();
 
   constructor(options: MessageHandlerOptions) {
     this.options = options;
@@ -593,6 +595,22 @@ export class MessageHandler {
         console.error(`[message-handler] max-command failed: /max:${routed.name} ${routed.args.join(" ")} — ${err instanceof Error ? err.message : String(err)}`);
         throw err;
       });
+
+      if (result.resetWorkspace) {
+        const reset = this.forceResetWorkspace(channelKey, wsName);
+        clearConversationLog();
+        destroyAndInvalidateSession(wsName);
+        const lines = [
+          `🧹 已重置当前 workspace 会话 (${wsName})。`,
+          `- 已取消当前请求: ${reset.cancelledActive ? "是" : "否"}`,
+          `- 已清空等待队列: ${reset.cancelledQueued} 条`,
+          "- 已清空以往对话上下文",
+          "- clear 之前的响应将不会再发送",
+        ];
+        callback(lines.join("\n"), true);
+        return;
+      }
+
       console.log(`[message-handler] max-command result (${result.reply.length} chars): ${result.reply.slice(0, 120)}`);
       callback(result.reply, true);
 
@@ -699,6 +717,52 @@ export class MessageHandler {
     }
 
     return { cancelledQueued: totalQueued, cancelledActive: anyActiveCancelled };
+  }
+
+  /**
+   * Force-reset one channel/workspace. Bumps generation first so any delayed
+   * callbacks from older turns are ignored, then cancels queued and active work.
+   */
+  forceResetWorkspace(channelId: string, wsName: string): { cancelledQueued: number; cancelledActive: boolean } {
+    const qKey = wsKey(channelId, wsName);
+    this.channelGenerations.set(qKey, (this.channelGenerations.get(qKey) ?? 0) + 1);
+
+    let cancelledQueued = 0;
+    const queue = this.channelQueues.get(qKey);
+    if (queue) {
+      cancelledQueued = queue.length;
+      const err = new Error("Cancelled by /max:clear");
+      (err as Error & { silentCancel?: boolean }).silentCancel = true;
+      for (const item of queue) item.reject(err);
+      this.channelQueues.delete(qKey);
+    }
+
+    this.channelCancels.add(qKey);
+    const active = this.channelActive.get(qKey);
+    let cancelledActive = false;
+    if (active) {
+      const err = new Error("Cancelled by /max:clear");
+      (err as Error & { silentCancel?: boolean }).silentCancel = true;
+      active.reject(err);
+      this.channelActive.delete(qKey);
+      cancelledActive = true;
+    }
+
+    const pending = this.pendingInput.get(qKey);
+    if (pending) {
+      this.pendingInput.delete(qKey);
+      pending.resolve(ASK_USER_FALLBACK_ANSWER);
+      cancelledActive = true;
+    }
+
+    this.clearHardTimer(qKey);
+    this.hardTimerRejects.delete(qKey);
+    this.activeCallbacks.delete(qKey);
+    for (const [sessionId, key] of [...this.sessionChannels.entries()]) {
+      if (key === qKey) this.sessionChannels.delete(sessionId);
+    }
+
+    return { cancelledQueued, cancelledActive };
   }
 
   /** Flush all queues (e.g., on shutdown) */
@@ -825,6 +889,12 @@ export class MessageHandler {
     // disabled by config.
     const callback = wrapCallbackWithWorkspaceTag(item.callback, wsName);
     const qKey = wsKey(channelId, wsName);
+    const generation = this.channelGenerations.get(qKey) ?? 0;
+    const isCurrentGeneration = () => (this.channelGenerations.get(qKey) ?? 0) === generation;
+    const safeCallback: MessageCallback = (text, done, meta) => {
+      if (!isCurrentGeneration()) return;
+      callback(text, done, meta);
+    };
 
     switch (routed.type) {
       case "max-command": {
@@ -837,7 +907,7 @@ export class MessageHandler {
           channelKey: channelId,
         });
         console.log(`[message-handler] max-command result (${result.reply.length} chars): ${result.reply.slice(0, 120)}`);
-        callback(result.reply, true);
+        safeCallback(result.reply, true);
         break;
       }
 
@@ -869,7 +939,7 @@ export class MessageHandler {
   
             // Store session→composite-key mapping so handleUserInput can find the right callback
             this.sessionChannels.set(session.sessionId, qKey);
-            this.activeCallbacks.set(qKey, callback);
+            this.activeCallbacks.set(qKey, safeCallback);
   
             // Debug: log all session events related to tools/permissions/errors
             // Track session.error events so we can report them to the user
@@ -914,7 +984,7 @@ export class MessageHandler {
                       const chunk = event.data.deltaContent;
                       if (chunk) {
                         fullText += chunk;
-                        callback(fullText, false);
+                        safeCallback(fullText, false);
                       }
                     });
                     cleanupFns.push(unsubDelta);
@@ -929,7 +999,7 @@ export class MessageHandler {
                       }
                       logConversation("assistant", fullText, `copilot:${workspaceName}`);
                       console.log(`[message-handler] Prompt response (${Date.now() - t0}ms, ${fullText.length} chars): ${fullText.slice(0, 300)}`);
-                      callback(fullText, true);
+                      safeCallback(fullText, true);
                       resolve(fullText);
                     });
                     cleanupFns.push(unsubIdle);
