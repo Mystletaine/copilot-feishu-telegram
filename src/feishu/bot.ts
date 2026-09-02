@@ -243,7 +243,7 @@ async function drainHeldMessages(openId: string, wsName: string, messageHandler:
     const channelKey = `feishu:${openId}`;
     const routed = route(text, { senderId: openId, channelKey, messageId });
     clearThinkingTimer(openId, wsName);
-    let thinkingSent = false;
+    const startedAt = Date.now();
     const sendThinking = () => {
       if (hasAnyPending(openId)) {
         console.log(`[feishu:drainHeld] sendThinking skipped (pending question) | pendingQ=true`);
@@ -255,21 +255,20 @@ async function drainHeldMessages(openId: string, wsName: string, messageHandler:
         clearThinkingTimer(openId, wsName);
         return;
       }
-      thinkingSent = true;
-      console.log(`[feishu:drainHeld] sendThinking fired | thinkingSent=${thinkingSent} busy=true pendingQ=false ws=${wsName}`);
-      void sendReply(messageId, chatId, `${buildWorkspaceTag(wsName)}⏳ 正在思考...`);
+      console.log(`[feishu:drainHeld] sendThinking fired | busy=true pendingQ=false ws=${wsName}`);
+      void sendReply(messageId, chatId, buildThinkingText(wsName, startedAt));
     };
     const resetThinkingTimer = (fromEarlySend: boolean = false) => {
       clearThinkingTimer(openId, wsName);
       if (fromEarlySend) {
-        setThinkingTimer(openId, wsName, setInterval(sendThinking, 3 * 60 * 1000));
+        setThinkingTimer(openId, wsName, setInterval(sendThinking, config.feishuThinkingIntervalMs));
       } else {
         const initial = setTimeout(() => {
           sendThinking();
           if (!hasAnyPending(openId)) {
-            setThinkingTimer(openId, wsName, setInterval(sendThinking, 3 * 60 * 1000));
+            setThinkingTimer(openId, wsName, setInterval(sendThinking, config.feishuThinkingIntervalMs));
           }
-        }, 7000);
+        }, config.feishuThinkingInitialDelayMs);
         setThinkingTimer(openId, wsName, initial);
       }
     };
@@ -384,12 +383,46 @@ type MessageReceiveEvent = {
     chat_type: "p2p" | "group" | string;
     message_type: string;
     content: string;
+    create_time?: string;
   };
 };
 
 /** Early-send configuration. */
 const EARLY_SEND_IDLE_MS = 5000;       // wait 5 s after last delta before early-send
 const SENTENCE_END_RE = /[。.]\s*$/;   // ends with Chinese or English period
+
+function formatDuration(ms: number): string {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (hours > 0) return `${hours} 小时 ${minutes} 分钟`;
+  if (minutes > 0) return `${minutes} 分钟 ${seconds} 秒`;
+  return `${seconds} 秒`;
+}
+
+function getMessageCreateTimeMs(event: MessageReceiveEvent): number | undefined {
+  const raw = event.message.create_time;
+  if (!raw) return undefined;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) return undefined;
+  return parsed < 10_000_000_000 ? parsed * 1000 : parsed;
+}
+
+function isStaleMessage(event: MessageReceiveEvent): boolean {
+  const createdAt = getMessageCreateTimeMs(event);
+  if (createdAt === undefined) return false;
+  const ageMs = Date.now() - createdAt;
+  if (ageMs <= config.feishuMessageMaxAgeMs) return false;
+  markMessageProcessed(event.message.message_id);
+  console.log(`[feishu] Dropped stale message_id=${event.message.message_id} age=${formatDuration(ageMs)} max=${config.feishuMessageMaxAgeMs}ms`);
+  return true;
+}
+
+function buildThinkingText(wsName: string, startedAt: number): string {
+  const elapsed = formatDuration(Date.now() - startedAt);
+  return `${buildWorkspaceTag(wsName)}⏳ Copilot 正在响应中，当前会话已持续 ${elapsed}。\n发送 /max:cancel 可取消当前请求，发送 /max:clear 可重置当前 workspace。`;
+}
 
 /** Route and process a message through the unified message handler.
  *  Handles all routed types: max-command, cli-command, prompt.
@@ -673,6 +706,8 @@ export function createBot(messageHandler: MessageHandler): { client: Lark.Client
         return; // don't process further until paired
       }
 
+      if (isStaleMessage(event)) return;
+
       // v1: group chats check already done above.
 
       // v1: handle plain text, image, and text-based file messages.
@@ -814,6 +849,14 @@ export function createBot(messageHandler: MessageHandler): { client: Lark.Client
         return;
       }
 
+      if (text.trim() === "/max:clear") {
+        const channelKey = `feishu:${senderOpenId}`;
+        const activeWs = getActiveWorkspace(channelKey);
+        clearPending(senderOpenId, activeWs);
+        clearThinkingTimer(senderOpenId, activeWs);
+        heldMessages.delete(senderOpenId);
+      }
+
       // ── Pending question: route text as an answer ──────────────
       const channelKey = `feishu:${senderOpenId}`;
       const activeWs = getActiveWorkspace(channelKey);
@@ -886,7 +929,7 @@ export function createBot(messageHandler: MessageHandler): { client: Lark.Client
 
       // Clear any leftover thinking timer for this sender + workspace
       clearThinkingTimer(senderOpenId, activeWs);
-      let thinkingSent = false;
+      const startedAt = Date.now();
       const sendThinking = () => {
         if (hasAnyPending(senderOpenId)) {
           console.log(`[feishu:main] sendThinking skipped (pending question) | pendingQ=true`);
@@ -898,23 +941,22 @@ export function createBot(messageHandler: MessageHandler): { client: Lark.Client
           clearThinkingTimer(senderOpenId, activeWs);
           return;
         }
-        thinkingSent = true;
-        console.log(`[feishu:main] sendThinking fired | thinkingSent=${thinkingSent} busy=true pendingQ=false ws=${activeWs}`);
-        void sendReply(event.message.message_id, event.message.chat_id, `${buildWorkspaceTag(activeWs)}⏳ 正在思考...`);
+        console.log(`[feishu:main] sendThinking fired | busy=true pendingQ=false ws=${activeWs}`);
+        void sendReply(event.message.message_id, event.message.chat_id, buildThinkingText(activeWs, startedAt));
       };
       const resetThinkingTimer = (fromEarlySend: boolean = false) => {
         clearThinkingTimer(senderOpenId, activeWs);
         if (fromEarlySend) {
           // Early-send replaces the 7s wait; skip directly to 3-min interval
-          setThinkingTimer(senderOpenId, activeWs, setInterval(sendThinking, 3 * 60 * 1000));
+          setThinkingTimer(senderOpenId, activeWs, setInterval(sendThinking, config.feishuThinkingIntervalMs));
         } else {
-          // Initial setup: wait 7s, then show "正在思考", then repeat every 3m
+          // Initial setup: wait briefly, then repeat while Copilot remains busy.
           const initial = setTimeout(() => {
             sendThinking();
             if (!hasAnyPending(senderOpenId)) {
-              setThinkingTimer(senderOpenId, activeWs, setInterval(sendThinking, 3 * 60 * 1000));
+              setThinkingTimer(senderOpenId, activeWs, setInterval(sendThinking, config.feishuThinkingIntervalMs));
             }
-          }, 7000);
+          }, config.feishuThinkingInitialDelayMs);
           setThinkingTimer(senderOpenId, activeWs, initial);
         }
       };

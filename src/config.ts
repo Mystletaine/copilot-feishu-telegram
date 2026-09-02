@@ -17,6 +17,9 @@ const configSchema = z.object({
   FEISHU_APP_SECRET: z.string().min(1).optional(),
   FEISHU_AUTHORIZED_OPEN_ID: z.string().min(1).optional(),
   FEISHU_DOMAIN: z.enum(["feishu", "lark"]).optional(),
+  FEISHU_MESSAGE_MAX_AGE_MS: z.string().optional(),
+  FEISHU_THINKING_INITIAL_DELAY_MS: z.string().optional(),
+  FEISHU_THINKING_INTERVAL_MS: z.string().optional(),
   COPILOT_UI_SERVER_PORT: z.string().optional(),
   MAX_DELEGATE_MODEL: z.string().min(1).optional(),
   MAX_DELEGATE_API_KEY: z.string().min(1).optional(),
@@ -42,9 +45,37 @@ if (Number.isNaN(parsedPort) || parsedPort < 1 || parsedPort > 65535) {
 }
 
 const DEFAULT_WORKER_TIMEOUT_MS = 600_000; // 10 minutes
+const DEFAULT_FEISHU_MESSAGE_MAX_AGE_MS = 60 * 60 * 1000; // 1 hour
+const DEFAULT_FEISHU_THINKING_INITIAL_DELAY_MS = 7_000; // 7 seconds
+const DEFAULT_FEISHU_THINKING_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes
+
+function parsePositiveIntegerEnv(name: string, value: string | undefined, fallback: number): number {
+  const parsed = value ? Number(value) : fallback;
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(`${name} must be a positive integer (ms), got: "${value}"`);
+  }
+  return parsed;
+}
+
 const parsedWorkerTimeout = raw.WORKER_TIMEOUT
   ? Number(raw.WORKER_TIMEOUT)
   : DEFAULT_WORKER_TIMEOUT_MS;
+
+const parsedFeishuMessageMaxAgeMs = parsePositiveIntegerEnv(
+  "FEISHU_MESSAGE_MAX_AGE_MS",
+  raw.FEISHU_MESSAGE_MAX_AGE_MS,
+  DEFAULT_FEISHU_MESSAGE_MAX_AGE_MS,
+);
+const parsedFeishuThinkingInitialDelayMs = parsePositiveIntegerEnv(
+  "FEISHU_THINKING_INITIAL_DELAY_MS",
+  raw.FEISHU_THINKING_INITIAL_DELAY_MS,
+  DEFAULT_FEISHU_THINKING_INITIAL_DELAY_MS,
+);
+const parsedFeishuThinkingIntervalMs = parsePositiveIntegerEnv(
+  "FEISHU_THINKING_INTERVAL_MS",
+  raw.FEISHU_THINKING_INTERVAL_MS,
+  DEFAULT_FEISHU_THINKING_INTERVAL_MS,
+);
 
 if (!Number.isInteger(parsedWorkerTimeout) || parsedWorkerTimeout <= 0) {
   throw new Error(`WORKER_TIMEOUT must be a positive integer (ms), got: "${raw.WORKER_TIMEOUT}"`);
@@ -84,6 +115,25 @@ export const config = {
   feishuAppId: raw.FEISHU_APP_ID,
   feishuAppSecret: raw.FEISHU_APP_SECRET,
   feishuDomain: raw.FEISHU_DOMAIN ?? "feishu",
+  /**
+   * Maximum age of an incoming Feishu message event that Max will process.
+   * Older events are marked as processed and dropped silently so reconnects or
+   * Feishu retries cannot make the bot answer stale messages long after the
+   * user sent them. Unit: milliseconds. Default: 1 hour.
+   */
+  feishuMessageMaxAgeMs: parsedFeishuMessageMaxAgeMs,
+  /**
+   * Delay before the first Feishu "Copilot is still responding" status notice.
+   * This avoids noise for fast replies while still showing liveness for slow
+   * turns. Unit: milliseconds. Default: 7 seconds.
+   */
+  feishuThinkingInitialDelayMs: parsedFeishuThinkingInitialDelayMs,
+  /**
+   * Interval between repeated Feishu status notices while Copilot is still
+   * responding. Each notice includes the elapsed duration of the current turn.
+   * Unit: milliseconds. Default: 2 minutes.
+   */
+  feishuThinkingIntervalMs: parsedFeishuThinkingIntervalMs,
   get feishuAuthorizedOpenId(): string | undefined {
     return _feishuAuthorizedOpenId;
   },

@@ -11,7 +11,6 @@
  */
 
 import { createWorkspace, deleteWorkspace, listWorkspaces, getWorkspace, setActiveWorkspace, getActiveWorkspace } from "./store/db.js";
-import { destroyAndInvalidateSession } from "./copilot-client.js";
 import { join } from "path";
 import { existsSync } from "fs";
 import { config } from "./config.js";
@@ -49,6 +48,8 @@ export interface CommandResult {
   delegateStartPrompt?: string;
   /** If true, only enqueue delegateStartPrompt when Copilot is idle. */
   delegateStartOnlyIfIdle?: boolean;
+  /** If true, MessageHandler must force-reset the active workspace. */
+  resetWorkspace?: boolean;
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────
@@ -233,13 +234,9 @@ const handlers: Record<string, (args: string[], ctx: CommandContext) => Promise<
       };
     }
     const wsName = ctx.activeWorkspace;
-    if (!destroyAndInvalidateSession(wsName)) {
-      return {
-        reply: `⏳ Workspace '${wsName}' is busy with an in-flight prompt. Use /max:cancel first, then /max:clear.`,
-      };
-    }
     return {
-      reply: `🧹 Max session cleared for workspace '${wsName}'. The next prompt will start a fresh conversation.`,
+      reply: `Resetting workspace '${wsName}'.`,
+      resetWorkspace: true,
     };
   },
 
